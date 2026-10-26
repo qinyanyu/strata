@@ -85,7 +85,7 @@ std::vector<int> parse_ids(const std::string& s) {
 
 void usage() {
     std::fprintf(stderr,
-                 "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
+                 "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--expert-cache-device1 N|auto] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
@@ -1211,6 +1211,9 @@ int main(int argc, char** argv) {
         if (a == "--pack") o.pack = val("--pack");
         else if (a == "--gpus") {
             for (int g : parse_ids(val("--gpus"))) o.gpus.push_back(g);
+        } else if (a == "--expert-cache-device1") {
+            const std::string v = val("--expert-cache-device1");
+            o.expert_cache_device1 = v == "auto" ? -1 : std::max(0, std::atoi(v.c_str()));
         } else if (a == "--max-context") o.max_context = std::atoll(val("--max-context").c_str());
         else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val("--reserve-mib").c_str());
         else if (a == "--vram-experts") o.vram_experts = std::atof(val("--vram-experts").c_str());
