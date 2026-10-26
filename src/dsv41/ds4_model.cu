@@ -1102,6 +1102,14 @@ struct Model::Impl {
         }
         return !file_experts || os::in_ram(file_part(l, e), l.blob);
     }
+    // where a small window's pick of expert e of l is computed (skip: DISK_SKIP_W's bar applies to this layer)
+    enum class Lane { Vram, StoreZc, Skip, Cpu };
+    Lane lane_of(const Layer& l, int e, int T, bool skip, float w, float skip_below) const {
+        if (l.slot[(size_t) e] >= 0) return Lane::Vram;
+        if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) return Lane::StoreZc;
+        if (skip && w < skip_below && !in_ram(l, e)) return Lane::Skip;
+        return Lane::Cpu;
+    }
     // a GGUF's CPU-lane experts copied into RAM (copy_experts, after VRAM took its share: --mmap-experts off - auto reads
     // them in place; DS4_COPY_GB=<n>: the hottest n GB, the rest in place - static, no moves between
     // them): RAM slots (l.ram, as the tier's) of NH parts, part X on NUMA node X with rows [X n / NH, (X + 1) n / NH) of
@@ -6805,24 +6813,24 @@ struct Model::Impl {
                             st.ahead_hit += (fl[e] & 6) != 0;
                             st.ahead_hit2 += (fl[e] >> 2) & 1;
                         }
-                        if (l.slot[(size_t) e] < 0) {
-                            l.cpu_hits.push_back(e);
-                            if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
-                                store->touch(li, e);
-                                ++st.store_zc;
-                                continue;
-                            }
-                            if (dsk && r.w[t][i] < disk_skip_w * wsum && !in_ram(l, e)) {
-                                ++st.skipped;
-                                continue;
-                            }
-                            if (!l.ram.empty() && l.ram[(size_t) e] >= 0) ++st.ram_experts;
-                            else if (fl != nullptr) {
-                                ++st.ahead_cold;
-                                st.ahead_cold_hit += (fl[e] >> 3) & 1;
-                            }
-                            picks.push_back({e, t * kPicks + i});
+                        const Lane lane = lane_of(l, e, T, dsk, r.w[t][i], disk_skip_w * wsum);
+                        if (lane == Lane::Vram) continue;
+                        l.cpu_hits.push_back(e);
+                        if (lane == Lane::StoreZc) {   // the device computed it from the store's slot
+                            store->touch(li, e);
+                            ++st.store_zc;
+                            continue;
                         }
+                        if (lane == Lane::Skip) {
+                            ++st.skipped;
+                            continue;
+                        }
+                        if (!l.ram.empty() && l.ram[(size_t) e] >= 0) ++st.ram_experts;
+                        else if (fl != nullptr) {
+                            ++st.ahead_cold;
+                            st.ahead_cold_hit += (fl[e] >> 3) & 1;
+                        }
+                        picks.push_back({e, t * kPicks + i});
                     }
                 }
                 if (fl != nullptr) {   // the guesses by rank: how many were picked
