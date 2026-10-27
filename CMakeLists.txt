@@ -894,6 +894,37 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(ds4_pick_rule_test tests/dsv41/pick_rule_test.cpp)
       target_include_directories(ds4_pick_rule_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
       target_compile_features(ds4_pick_rule_test PRIVATE cxx_std_17)
+      # the decode scheduler of docs/DSV41_BATCHING.md (M1): admission order, chunking, budget, round robin; no GPU
+      add_executable(ds4_sched_test tests/dsv41/sched_test.cpp)
+      target_include_directories(ds4_sched_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+      target_compile_features(ds4_sched_test PRIVATE cxx_std_17)
+      # the batched-KV block tables (docs/DSV41_BATCHING.md, M2): slot arithmetic and LRU eviction; no GPU
+      add_executable(ds4_batch_kv_test tests/dsv41/batch_kv_test.cpp)
+      target_include_directories(ds4_batch_kv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+      target_compile_features(ds4_batch_kv_test PRIVATE cxx_std_17)
+      # the scheduler step -> per-run KV blocks (docs/DSV41_BATCHING.md, M2); no GPU
+      add_executable(ds4_batch_plan_test tests/dsv41/batch_plan_test.cpp)
+      target_include_directories(ds4_batch_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+      target_compile_features(ds4_batch_plan_test PRIVATE cxx_std_17)
+      # the parked states of the burst-interleaving path (docs/DSV41_BATCHING.md, Path B); no GPU
+      add_executable(ds4_state_bank_test tests/dsv41/state_bank_test.cpp)
+      target_include_directories(ds4_state_bank_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+      target_compile_features(ds4_state_bank_test PRIVATE cxx_std_17)
+      # the engine's batch lines: BGEN/BGENI split and when an admission continues in its slot (M4); no GPU
+      add_executable(ds4_batch_proto_test tests/dsv41/batch_proto_test.cpp)
+      target_include_directories(ds4_batch_proto_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+      target_compile_features(ds4_batch_proto_test PRIVATE cxx_std_17)
+      # the M2 step table: several sequences' KV regions in one buffer (docs/DSV41_BATCHING.md); no GPU
+      add_executable(ds4_batch_attn_test tests/dsv41/batch_attn_test.cpp)
+      target_include_directories(ds4_batch_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+      target_compile_features(ds4_batch_attn_test PRIVATE cxx_std_17)
+      # the attention kernel with T queries over disjoint regions against the same queries one at a time (M2); GPU
+      set_source_files_properties(tests/dsv41/attn_batch_test.cpp PROPERTIES LANGUAGE ${_ds4_test_lang})
+      add_executable(ds4_attn_batch_test tests/dsv41/attn_batch_test.cpp src/dsv41/ds4_kernels.cu)
+      target_include_directories(ds4_attn_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${_strata_gpu_include_directories})
+      target_link_libraries(ds4_attn_batch_test PRIVATE ${_strata_gpu_runtime_target} Threads::Threads)
+      target_compile_definitions(ds4_attn_batch_test PRIVATE STRATA_DSV41_TQ_CPU=1)
     endif()
     if(STRATA_ENABLE_HIP)
       foreach(_t strata_dsv41_kernels strata-dsv41)

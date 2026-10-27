@@ -25,6 +25,10 @@ namespace strata::ds4 {
 struct Options {
     std::string pack;                 // <model>/maya-ds4
     int64_t max_context = 32768;
+    // the tokens one conversation (a batch slot) may hold - the compressed KV tables are sized a sequence by this, so
+    // with several sequences it is what keeps the table from taking the experts' VRAM (M5: 32K a slot at 16 slots).
+    // 0: max_context (the pack's whole window, one conversation)
+    int64_t slot_context = 0;
     std::vector<int> gpus;            // empty: every visible GPU
     int64_t reserve_mib = 600;        // VRAM left free on each GPU
     double vram_experts = 1.0;        // the share of the expert budget to use (tests: less, so the CPU lane works)
@@ -112,12 +116,16 @@ public:
     /// Feeds n tokens (windows of up to 16, or a long run in chunks of prefill_chunk); the last `logits_rows` of them get
     /// logits (logits_rows > 16: only a run of one chunk or window).
     bool feed(const int* tokens, int n, int logits_rows, std::string& err);
+    // M2's batched step: T rows, a token of a sequence each, its position from that sequence's state (the logits land in
+    // the head device's rows 0 .. T-1)
+    bool forward_rows(const int* pos, const int* seq, const int* tokens, int T, std::string& err);
     /// feed() of a prompt's end that also keeps the state before its last token in checkpoint `slot` (a prompt's
     /// last token then rides along in the run of chunks instead of a window of its own); the same as
     /// feed(n - 1), checkpoint(slot), feed(1)
     bool feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err);
     /// The next token from the last feed's last logit row (greedy when temperature <= 0).
-    int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter);
+    int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
+               int row = -1);   // (row: M2's batched step; -1 the last row)
     /// The last feed's logit rows on the host (rows x vocab floats).
     bool logits(std::vector<float>& out);
 
@@ -145,6 +153,12 @@ public:
     void set_cancel(std::function<bool()> f);
     bool cancelled() const;   // the last feed() / feed_mark() ended early on a Stop
     int64_t pos() const;
+    /// The sequence a pass works on (0 .. seq_count() - 1): its state, its window ring and its rows of the compressed
+    /// tables (docs/DSV41_BATCHING.md, M2).  0 - the engine's one conversation - unless the serve loop keeps several.
+    void use_seq(int seq);
+    int seq_count() const;
+    /// The tokens a sequence's state holds so far (its next row's position); the sequence a step's row names.
+    int64_t seq_pos(int seq) const;
     int64_t max_context() const;
     int vocab() const;
     int dim() const;
@@ -173,6 +187,15 @@ public:
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
     std::string slot_identity() const;
+
+    /// A batch slot's state parked where it lives - in the cards' memory (the device half of slot_save/slot_load; the
+    /// tokens and the checkpoints are kept beside it): a slot's turn switch is then a device-to-device copy instead of a
+    /// round trip over PCIe.  park_new() takes an id, park_save/park_load move the state, park_free gives the memory
+    /// back.  park_save returns the bytes kept (0 and err: no conversation, pictures, or not enough device memory).
+    int64_t park_new();
+    uint64_t park_save(int64_t id, std::string& err);
+    bool park_load(int64_t id, std::string& err);
+    void park_free(int64_t id);
 
     /// The vision tower: the token every position of an image's span carries (-1: no tower).
     int image_token() const;

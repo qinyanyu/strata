@@ -18,6 +18,16 @@
 // `pin=N` on a GEN marks the first N prompt tokens as a start other requests share (a system prompt and its tools): the
 // read stops there for a checkpoint, so a request behind the same start - another agent - goes back to it instead of
 // reading it again (also without slots).  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
+// --batch N speaks the server's batched path (docs/DSV41_BATCHING.md, M4): `BGEN <slot> <max_new> [keys] <ids>` reads
+// the request's prompt and first token as a GEN 1, answers `BADM <slot> 1`, then decodes the rest on `BT <slot> <id>` lines
+// until `BDONE <slot> <produced> <finish> <ms>`; `BSTOP <slot>` ends one slot.  `BYIELD <slot>` (a shorter request waits
+// for the control lines) ends a prompt read between two 1024-token slices: `YIELDED <slot> <tokens read>` and DONE, and
+// the same prompt's next call reads on from there - a quick chat does not wait behind a 40k-token agent prompt.  INFO
+// batch_slots=N turns the server's path on, so it is said only here.  With N > 1 the model still holds one conversation: a slot that is not decoding is set
+// aside in host memory (Model::slot_save) and loaded back for its next burst (`--slot-burst K`, 16 by default), so the
+// slots take turns and their BT lines interleave.  That is the latency half of the design in docs/DSV41_BATCHING.md -
+// the same tokens go through the same kernels, so the aggregate stays until M2/M3 (per-sequence KV, batched MoE).
+#include "ds4_batch_proto.hpp"
 #include "ds4_model.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
@@ -87,7 +97,8 @@ void usage() {
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--batch N] [--slot-burst K] [--read-slice N]\n"
+                 "           [--slot-context N]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
                  "           | --pack-info)\n");
@@ -100,6 +111,8 @@ struct Lines {
     std::deque<std::string> q;
     bool eof = false;
     std::atomic<bool> stop{false};
+    std::atomic<int> bstop{-1};   // BSTOP <slot>: that batch slot's decode ends (the server's batched path, M4)
+    std::atomic<int> byield{-1};  // BYIELD <slot>: the control lines are wanted elsewhere - a read gives way (#656)
     void start() {
         std::thread([this] {
             std::string l;
@@ -108,6 +121,14 @@ struct Lines {
                 std::lock_guard<std::mutex> lk(mu);
                 if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
                     stop.store(true);
+                    continue;
+                }
+                if (l.rfind("BSTOP", 0) == 0) {   // (only that slot ends; a STOP would end whatever runs)
+                    bstop.store(l.size() > 6 ? std::atoi(l.c_str() + 6) : -1);
+                    continue;
+                }
+                if (l.rfind("BYIELD", 0) == 0) {
+                    byield.store(l.size() > 7 ? std::atoi(l.c_str() + 7) : -1);
                     continue;
                 }
                 if (l == "QUIT") stop.store(true);
@@ -119,6 +140,18 @@ struct Lines {
             stop.store(true);
             cv.notify_all();
         }).detach();
+    }
+    bool try_next(std::string& l) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (q.empty()) return false;
+        l = q.front();
+        q.pop_front();
+        return true;
+    }
+    void push_front(const std::deque<std::string>& more) {
+        std::lock_guard<std::mutex> lk(mu);
+        for (auto it = more.rbegin(); it != more.rend(); ++it) q.push_front(*it);
+        cv.notify_all();
     }
     bool next(std::string& l) {
         std::unique_lock<std::mutex> lk(mu);
@@ -315,12 +348,56 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
 
-int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
+// M1 of docs/DSV41_BATCHING.md: a queued shorter prompt goes before the current one.  The engine still runs one
+// request at a time; this only decides which of the lines already waiting is read next (the server's
+// STRATA_ADMIT_SHORT_FIRST rule, at the engine).  STRATA_DS4_ADMIT_SHORT_FIRST=0 turns it off.
+static int64_t gen_prompt_len(const std::string& line, bool& is_gen) {
+    strata::ds4::batchproto::Admission adm;   // a BGEN is a request too: the admission order is about its prompt
+    if (strata::ds4::batchproto::split(line, adm)) {
+        is_gen = true;
+        Req r;
+        return parse_gen(adm.request, r, adm.request.rfind("GENI ", 0) == 0) ? (int64_t) r.ids.size() : -1;
+    }
+    const bool geni = line.rfind("GENI ", 0) == 0;
+    is_gen = geni || line.rfind("GEN ", 0) == 0;
+    if (!is_gen) return 0;
+    Req r;
+    if (!parse_gen(line, r, geni)) return -1;
+    return (int64_t) r.ids.size();
+}
+
+static void admit_short_first(Lines& in, std::string& line) {
+    static const int64_t kShort = []() {
+        const char* e = std::getenv("STRATA_DS4_ADMIT_SHORT_FIRST");
+        return e != nullptr ? std::atoll(e) : (int64_t) 2048;
+    }();
+    if (kShort <= 0) return;
+    std::deque<std::string> all;
+    all.push_back(line);
+    std::string l;
+    while (in.try_next(l)) all.push_back(l);
+    std::stable_sort(all.begin(), all.end(), [](const std::string& a, const std::string& b) {
+        bool ga = false, gb = false;
+        const int64_t na = gen_prompt_len(a, ga), nb = gen_prompt_len(b, gb);
+        if (ga != gb) return ga;
+        return ga && na < nb;
+    });
+    line = all.front();
+    all.pop_front();
+    in.push_front(all);
+}
+
+int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
+          int batch_slots, int slot_burst, int read_slice) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    // the server's batched path turns on from this INFO line alone (serve/server.py: self.batch = batch_slots), so it is
+    // printed only when the serve loop really speaks BGEN (docs/DSV41_BATCHING.md, M4)
+    if (batch_slots > 0) std::printf("INFO batch_slots=%d\n", batch_slots);
     std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
-    std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
+    std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; "
+                         "BGEN[I] <slot> <max_new> [keys] <ids>; STOP, BSTOP <slot>, QUIT\n");
     Lines in;
     in.start();
     std::string line;
@@ -643,15 +720,404 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::signal(SIGPIPE, SIG_IGN);
 #endif
     }
-    while (in.next(line)) {
+    // BATCH SLOTS (docs/DSV41_BATCHING.md, M4 with N > 1): the model holds one conversation at a time, so a slot that
+    // is not decoding is set aside in host memory (Model::slot_save - the bytes the conversation folder keeps) and
+    // loaded back (slot_load) for its next burst.  --batch 1 gives one slot and no switch at all; without --batch
+    // nothing here runs and the engine is the one-at-a-time one the server ran before.
+    struct Run {
+        int slot = -1;              // -1: a solo GEN (T lines, DONE); >= 0: a batch slot (BT lines, BDONE)
+        Req req;
+        long long limit = 0;        // tokens this answer may produce, the admission's own token included
+        long long produced = 0;
+        long long d_acc = 0, d_off = 0;
+        unsigned long long counter = 0;
+        bool cool = false;
+        int tok = 0;                // sampled, not fed yet
+        std::vector<int> got;       // the tokens after tok (reversed: the next one is back())
+        const char* finish = "length";
+        bool ended = false;
+        bool continued = false;     // (BADM said 1: its answer ends with BDONE)
+        bool active = false;
+        bool no_switch = false;     // pictures: their state cannot be set aside, so the slot runs to its end
+        size_t reused = 0;
+        double t_prompt0 = 0.0, t_prompt1 = 0.0, t_slot0 = 0.0;
+        std::vector<uint8_t> parked;   // its conversation while it is not in the model (the host copy)
+        size_t parked_tokens = 0;
+        int64_t park_id = -1;          // (the device park: its arena, taken on the first switch out)
+        bool parked_dev = false;
+        std::vector<int> parked_ids;   // (the conversation's tokens, so its next turn is recognized and taken back)
+        strata::ds4::Stats s_dec;
+        long long io_dec = -1;
+    };
+    std::vector<Run> bslots((size_t) std::max(1, batch_slots));
+    int cur = -1;                   // the slot whose conversation the model holds (-1: none of them)
+    size_t rr_last = (size_t) -1;
+    // --slot-burst K: K tokens a slot decodes before another gets the model.  0 (the default now): measured - the burst
+    // where a turn's switch costs at most 5 % of the burst's own time, which on the live path (no state to copy) is one
+    // token and with parked states is a handful; nothing here is a model's or a box's constant
+    int burst = slot_burst > 0 ? slot_burst : 8;   // (the seed; adapted after every burst when auto)
+    // (STRATA_DS4_BATCH_LIVE=1: a slot's conversation stays in its own sequence of the model - its rings, compressed rows,
+    // its compressors' partial group and its state are per sequence (M2) - instead of being parked in host memory between
+    // its bursts.  A solo GEN gets the sequence after the slots')
+    const bool live = std::getenv("STRATA_DS4_BATCH_LIVE") != nullptr;
+    // (STRATA_DS4_STEP=1: M2's single-launch step - every active slot's next token through the layers in ONE pass (each
+    // row its own sequence), then a sample a row.  It needs the live slots: a row works on its own sequence's state)
+    const bool step_mode = std::getenv("STRATA_DS4_STEP") != nullptr && live;
+    constexpr int kStepRows = 16;   // (a step's rows: the model's window, kWin)
+    if (std::getenv("STRATA_DS4_STEP") != nullptr && !live)
+        std::fprintf(stderr, "ds4 serve: STRATA_DS4_STEP needs STRATA_DS4_BATCH_LIVE=1 (a step's rows are sequences)\n");
+    const int solo_seq = live ? (int) bslots.size() : 0;
+    const int slice_tokens = read_slice > 0 ? read_slice : 1024;   // (--read-slice: how much of a prompt one feed reads)
+    const bool slot_trace = std::getenv("STRATA_DS4_SLOT_TRACE") != nullptr;   // (the switch's cost, for M5's tuning)
+    // (STRATA_DS4_PARK_DEVICE=1: a slot's turn switch copies the state device to device instead of through the host)
+    const bool park_device = std::getenv("STRATA_DS4_PARK_DEVICE") != nullptr;
+    // (STRATA_DS4_BATCH_NOSPEC=1: a batch slot decodes without the DSpark drafter - the tuning question of
+    // docs/DSV41_BATCHING.md's open questions: with several sequences on the one model the drafts cost every one of them)
+    const bool batch_nospec = std::getenv("STRATA_DS4_BATCH_NOSPEC") != nullptr;
+    std::string err;                // (the model's last error, for the admission and for a slot's round)
+    // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
+    // VRAM hit, promotions a token) and DeepSeek's own - experts a token on the CPU lane, MB a token the storage
+    // read (Linux), the n-gram memory's (Engram) read time a token, the drafts' acceptance
+    auto stat_line = [&](const Run& run) {
+        const strata::ds4::Stats& s = m.stats();
+        const double ms = now_ms() - run.t_prompt1;
+        const double fed = (double) std::max<int64_t>(1, s.tokens - run.s_dec.tokens);
+        const double ex = (double) (s.experts - run.s_dec.experts), cx = (double) (s.cpu_experts - run.s_dec.cpu_experts);
+        std::string out = "STAT";
+        char b[160];
+        std::snprintf(b, sizeof b, " tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f ram=%.3f promo=%.3f engram_ms=%.3f",
+                      ms > 0 ? 1000.0 * (double) run.produced / ms : 0.0,
+                      run.produced > 0 ? ms / (double) run.produced : 0.0, ex > 0 ? 1.0 - cx / ex : 1.0, cx / fed,
+                      (double) (s.ram_experts - run.s_dec.ram_experts) / fed, (double) (s.swaps - run.s_dec.swaps) / fed,
+                      (s.engram_ms - run.s_dec.engram_ms) / fed);
+        out += b;
+        const long long io = io_read_bytes();
+        if (io >= 0 && run.io_dec >= 0) {
+            std::snprintf(b, sizeof b, " disk_mb=%.3f", (double) (io - run.io_dec) / 1e6 / fed);
+            out += b;
+        }
+        if (run.d_off > 0) {
+            std::snprintf(b, sizeof b, " drafts=%.3f", (double) run.d_acc / (double) run.d_off);
+            out += b;
+        }
+        if (s.skipped > run.s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)
+            std::snprintf(b, sizeof b, " skipped=%.3f", (double) (s.skipped - run.s_dec.skipped) / fed);
+            out += b;
+        }
+        std::printf("%s\n", out.c_str());
+    };
+    // one token of a run, the protocol half: the sampled one goes out (T, or BT in a slot), the admission's DONE/BADM
+    // with the first, and the end checks.  The token is the caller's to feed - a slot's own decode feeds it here
+    // (run_advance), M2's step feeds every active slot's in one pass (step_round).
+    const auto run_pos = [&](const Run& run) -> int64_t {   // (the run's own sequence: a step must not read another's)
+        return live && run.slot >= 0 ? m.seq_pos(run.slot) : m.pos();
+    };
+    const auto run_emit = [&](Run& run) -> bool {
+        if (in.stop.load() || (run.produced > 0 && run.slot >= 0 && in.bstop.load() == run.slot)) {
+            run.finish = "cancel";
+            run.ended = true;
+            return false;
+        }
+        if (run.slot >= 0 && run.produced > 0)
+            std::printf("BT %d %d\n", run.slot, run.tok);
+        else
+            std::printf("T %d\n", run.tok);
+        ++run.produced;
+        if (run.produced % 8 == 0) stat_line(run);
+        std::fflush(stdout);
+        bool end = false;
+        for (int e : eos) end = end || run.tok == e;
+        if (run.slot >= 0 && run.produced == 1) {
+            // the admission is the GEN 1 read the server follows on the control lines: its DONE, then BADM says whether
+            // the slot decodes the rest (BT lines) or that one token was the whole answer
+            const char* finish0 = end ? "stop" : "length";
+            const double t2a = now_ms();
+            std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", run.produced, run.req.ids.size(),
+                        run.t_prompt1 - run.t_prompt0, t2a - run.t_prompt1, finish0, run.d_acc, run.d_off, run.reused);
+            run.continued = strata::ds4::batchproto::continues(run.produced, run.limit, finish0);
+            std::printf("BADM %d %d\n", run.slot, run.continued ? 1 : 0);
+            std::fflush(stdout);
+            if (!run.continued) {
+                run.finish = finish0;
+                run.ended = true;
+                return false;
+            }
+            run.t_slot0 = now_ms();
+        }
+        if (end) {
+            run.finish = "stop";
+            run.ended = true;
+            return false;
+        }
+        if (run.produced >= run.limit || run_pos(run) >= m.max_context()) {
+            run.finish = "length";
+            run.ended = true;
+            return false;
+        }
+        return true;
+    };
+    // one token of a run on its own (a solo GEN, a slot without the step): the protocol, then the feed and the next sample
+    const auto run_advance = [&](Run& run) -> bool {
+        if (!run_emit(run)) return false;
+        if (run.got.empty()) {   // the next round: the drafts (if any) and the token after them
+            const int room = (int) std::min<long long>(run.limit - run.produced, m.max_context() - run_pos(run));
+            int off = 0, acc = 0;
+            // a round whose drafts were all below the confidence floor: the next one does without the drafter
+            // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
+            const bool try_spec = (run.req.spec < 0 ? spec : run.req.spec != 0) && !run.cool &&
+                                  !(batch_nospec && run.slot >= 0);
+            if (!round(m, run.tok, room, try_spec, run.req.conf >= 0 ? run.req.conf : conf_min, run.req.temperature,
+                       run.req.top_p, run.req.top_k, run.req.min_p, run.req.seed, run.counter, run.got, off, acc, err,
+                       run.req.cum)) {
+                std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                run.finish = "cancel";
+                run.ended = true;
+                return false;
+            }
+            run.d_off += off;
+            run.d_acc += acc;
+            run.cool = try_spec && off == 0;
+            std::reverse(run.got.begin(), run.got.end());
+        }
+        run.tok = run.got.back();
+        run.got.pop_back();
+        return true;
+    };
+    // the conversation in the model into slot s's own bytes (or, with STRATA_DS4_PARK_DEVICE, the cards' memory)
+    const auto park_slot = [&](int s) -> bool {
+        if (park_device) {
+            Run& run = bslots[(size_t) s];
+            if (run.park_id < 0) run.park_id = m.park_new();
+            std::string e;
+            if (run.park_id >= 0 && m.park_save(run.park_id, e) != 0) {
+                run.parked_dev = true;
+                return true;
+            }
+            std::fprintf(stderr, "ds4 serve: slot %d could not be parked on the cards (%s): the host copy is used\n", s,
+                         e.c_str());
+        }
+        const int64_t n_pos = m.pos();
+        std::vector<uint8_t> buf;
+        std::string e;
+        const uint64_t bytes = m.slot_save(buf, e);
+        if (bytes == 0) {
+            std::fprintf(stderr, "ds4 serve: slot %d could not be set aside (%s)\n", s, e.c_str());
+            return false;
+        }
+        bslots[(size_t) s].parked = std::move(buf);
+        bslots[(size_t) s].parked_tokens = (size_t) n_pos;
+        return true;
+    };
+    // a slot ends here: BDONE for a continued answer, the admission's DONE + BADM for one that never got its token
+    const auto end_slot = [&](int s, const char* why) {
+        Run& o = bslots[(size_t) s];
+        if (o.continued) {
+            stat_line(o);
+            const double t2 = now_ms();
+            std::printf("BDONE %d %lld %s %.1f\n", s, o.produced, why, t2 - o.t_slot0);
+            std::fflush(stdout);
+            std::fprintf(stderr, "maya ds4 serve: slot %d ended: %lld tokens in %.0f ms (%s)\n", s, o.produced,
+                         t2 - o.t_slot0, why);
+        } else if (o.produced == 0) {
+            // (it never got its token: the server still needs the admission's DONE and BADM, or it waits for ever)
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 %zu 0 0\n", o.req.ids.size(), o.reused);
+            std::printf("BADM %d 0\n", s);
+            std::fflush(stdout);
+        }
+        // the finished conversation stays in the slot's own bytes: the server sends its next turn back to this slot
+        // (pick_slot and slot_held), and the read then goes on from here instead of from token 0.  The folder keeps the
+        // big ones anyway; this is the cheap rung above it.
+        if (!live && o.continued && cur == s && held.empty() && m.pos() > 0 && m.pos() <= 65536) {
+            std::vector<uint8_t> buf;
+            std::string e;
+            const int64_t n_pos = m.pos();
+            if (m.slot_save(buf, e) != 0) {
+                o.parked = std::move(buf);
+                o.parked_tokens = (size_t) n_pos;
+                o.parked_ids = m.tokens();
+                std::fprintf(stderr, "ds4 serve: slot %d keeps its %lld-token conversation for its next turn\n", s,
+                             (long long) n_pos);
+            }
+        }
+        o.active = false;
+        o.continued = false;
+        if (cur == s) cur = -1;   // (the conversation stays in the model; the next admission sets it aside)
+    };
+    // M2's single-launch step (STRATA_DS4_STEP): the active slots' next tokens out (their protocol: T/BT, the
+    // admission's DONE/BADM, the end checks), then all of them through the layers in ONE pass - forward_rows, a row a
+    // sequence - and a sample a row.  Returns the rows run, 0 when nothing is active, -1 when the pass failed (the
+    // slots end there).  A picture slot is left to its own burst: its state cannot share a pass.
+    const auto step_round = [&]() -> int {
+        int who[kStepRows], tk[kStepRows], sq[kStepRows];
+        int T = 0;
+        for (int i = 0; i < (int) bslots.size() && T < kStepRows; ++i) {
+            Run& run = bslots[(size_t) i];
+            if (!run.active || run.no_switch) continue;
+            if (!run_emit(run)) {   // (it ends here: its last token was printed, nothing to feed)
+                end_slot(i, run.finish);
+                continue;
+            }
+            who[T] = i;
+            sq[T] = i;
+            tk[T] = run.tok;   // (the token just printed: it goes into its own sequence now)
+            ++T;
+        }
+        if (T == 0) return 0;
+        int pos[kStepRows];
+        for (int t = 0; t < T; ++t) pos[t] = (int) m.seq_pos(sq[t]);
+        if (!m.forward_rows(pos, sq, tk, T, err)) {
+            std::fprintf(stderr, "ds4 step: %d row(s) stopped: %s\n", T, err.c_str());
+            for (int t = 0; t < T; ++t) {
+                Run& run = bslots[(size_t) who[t]];
+                run.finish = "cancel";
+                run.ended = true;
+                end_slot(who[t], "cancel");
+            }
+            return -1;
+        }
+        for (int t = 0; t < T; ++t) {
+            Run& run = bslots[(size_t) who[t]];
+            run.tok = m.sample(run.req.temperature, run.req.top_p, run.req.top_k, run.req.min_p, run.req.seed,
+                               run.counter++, t);
+        }
+        return T;
+    };
+    // one burst of slot s: the model to its conversation, then up to a burst of tokens
+    const auto run_slot = [&](int s) {
+        Run& run = bslots[(size_t) s];
+        if (!run.active) return;
+        double switch_ms = 0.0;
+        if (cur != s) {
+            const double t_switch = now_ms();
+            if (live) {   // (its state is its own sequence: nothing to copy in)
+                m.use_seq(s);
+            } else if (cur >= 0) {
+                if (!park_slot(cur)) end_slot(cur, "cancel");   // (its bytes cannot be kept: it ends rather than be lost)
+                cur = -1;
+            } else if (m.pos() > 0) {
+                if (held.empty()) slot_put("");   // (a finished conversation: the folder may keep it for its next turn)
+                held.clear();
+            }
+            if (run.parked_dev) {
+                std::string e;
+                const bool ok = m.park_load(run.park_id, e);
+                run.parked_dev = false;
+                if (!ok) {
+                    std::fprintf(stderr, "ds4 serve: slot %d could not be loaded back from the cards (%s)\n", s, e.c_str());
+                    run.finish = "cancel";
+                    end_slot(s, "cancel");
+                    return;
+                }
+            } else if (!run.parked.empty()) {
+                std::string e;
+                const bool ok = m.slot_load(run.parked.data(), run.parked.size(), (int64_t) run.parked_tokens, e);
+                run.parked.clear();
+                run.parked.shrink_to_fit();
+                if (!ok) {
+                    std::fprintf(stderr, "ds4 serve: slot %d could not be loaded back (%s)\n", s, e.c_str());
+                    run.finish = "cancel";
+                    end_slot(s, "cancel");
+                    return;
+                }
+            }
+            cur = s;
+            switch_ms = now_ms() - t_switch;
+        }
+        const int lim = (run.no_switch || burst <= 0) ? INT_MAX : burst;
+        const long long before = run.produced;
+        const double t_burst = now_ms();
+        for (int k = 0; k < lim; ++k)
+            if (!run_advance(run)) break;
+        const double burst_ms = now_ms() - t_burst;
+        if (slot_burst <= 0) {
+            // auto: the shortest burst whose switch is at most 5 % of it (finer turns = shorter waiting; the switch is
+            // what a finer turn costs, and it is measured here rather than assumed)
+            const double toks = (double) std::max<long long>(1, run.produced - before);
+            const double per_tok = burst_ms / toks;
+            const int want = (int) std::ceil(switch_ms / std::max(1e-3, 0.05 * per_tok));
+            burst = std::max(1, std::min(64, want));
+        }
+        if (slot_trace)
+            std::fprintf(stderr, "ds4 slot: slot %d: %lld tokens in %.1f ms, switch %.1f ms, parked %zu bytes, burst %d\n",
+                         s, run.produced - before, burst_ms, switch_ms, run.parked.size(), burst);
+        if (run.ended) end_slot(s, run.finish);
+    };
+    // the next slot to run, round robin (a picture slot keeps the model until its answer is done)
+    const auto next_active = [&]() -> int {
+        if (cur >= 0 && bslots[(size_t) cur].active && bslots[(size_t) cur].no_switch) return cur;
+        const int n = (int) bslots.size();
+        for (int i = 1; i <= n; ++i) {
+            const int s = (int) ((rr_last + (size_t) i) % (size_t) n);
+            if (bslots[(size_t) s].active) {
+                rr_last = (size_t) s;
+                return s;
+            }
+        }
+        return -1;
+    };
+    for (;;) {
+        if (!in.try_next(line)) {
+            // (nothing waiting: give the slots their bursts - or, with STRATA_DS4_STEP, one pass over all of them - and
+            // only wait for a line when none is running)
+            if (step_mode) {
+                if (step_round() != 0) continue;   // (a pass ran; a failed one ended the slots)
+            } else {
+                const int s = next_active();
+                if (s >= 0) {
+                    run_slot(s);
+                    continue;
+                }
+            }
+            if (!in.next(line)) break;
+        }
         if (line == "QUIT") break;
+        admit_short_first(in, line);
+        // M4: BGEN[I] <slot> <max_new> ... is a request admitted into a batch slot.  Its prompt is read and its first
+        // token sampled exactly as GEN 1 does; the slot then decodes the rest (BT lines) after BADM.
+        int admit_slot = -1;
+        long long admit_max_new = 0;
+        {
+            strata::ds4::batchproto::Admission adm;
+            if (strata::ds4::batchproto::split(line, adm)) {
+                if (batch_slots <= 0) {
+                    std::printf("ERR BGEN: the engine's batch slots are off (start it with --batch N)\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (adm.slot < 0 || adm.slot >= batch_slots) {
+                    std::printf("ERR BGEN: no such slot %d (%d here)\n", adm.slot, batch_slots);
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (adm.max_new < 1) {
+                    std::printf("ERR BGEN: a slot's request needs a max_new of at least 1\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (bslots[(size_t) adm.slot].active) {
+                    std::printf("ERR BGEN: slot %d is still decoding\n", adm.slot);
+                    std::fflush(stdout);
+                    continue;
+                }
+                admit_slot = adm.slot;
+                admit_max_new = adm.max_new;
+                line = adm.request;
+            } else if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
+                std::printf("ERR BGEN: expected a slot and a max_new\n");
+                std::fflush(stdout);
+                continue;
+            }
+        }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+            std::printf("ERR unsupported command '%s' (GEN, GENI, BGEN, BGENI, STOP, BSTOP and QUIT)\n",
+                        line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
             continue;
         }
         in.stop.store(false);
+        in.bstop.store(-1);   // (a BSTOP for a slot of a request that has ended is stale)
+        in.byield.store(-1);
         Req r;
         if (!parse_gen(line, r, geni)) {
             std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> or GENI <max_new> [keys] <file> <id,id,...>\n");
@@ -670,13 +1136,57 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (!e.empty()) {
                 std::printf("ERR %s\n", e.c_str());
                 std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
+                if (admit_slot >= 0) std::printf("BADM %d 0\n", admit_slot);   // (an admission still ends: nothing runs)
                 std::fflush(stdout);
                 continue;
             }
         }
+        // the model holds one conversation: if it is an active slot's, set it aside in that slot's own bytes first (the
+        // admission below then starts from an empty state, and may still take a kept conversation from the folder)
+        const int read_seq = admit_slot >= 0 ? admit_slot : solo_seq;
+        if (live) {
+            m.use_seq(read_seq);   // (its own state: a prompt that continues it goes on, anything else resets below)
+            cur = -1;
+        } else if (cur >= 0) {
+            if (!park_slot(cur)) end_slot(cur, "cancel");
+            m.reset();
+            held.clear();
+            cur = -1;
+        }
         if (!reuse) {   // (STRATA_DS4_REUSE=0, for A/Bs and tests: every request is a fresh read of its whole prompt)
             m.reset();
             held.clear();
+        }
+        // A conversation's next turn re-renders its answer without the thinking the engine produced, so the state a slot
+        // kept can be *longer* than the new prompt (and the server's slot_held, which is tokens, then matches nothing):
+        // the engine looks through every slot's kept conversation for one this prompt continues, and loads the best.
+        // The prefix logic below then stops at one of its checkpoints and reads on from there.
+        bool from_park = false;
+        if (reuse && admit_slot >= 0 && pics.empty()) {
+            size_t best = bslots.size(), best_n = 0;
+            for (size_t k = 0; k < bslots.size(); ++k) {
+                const Run& c = bslots[k];
+                if (c.parked.empty() || c.parked_ids.empty()) continue;
+                size_t same_n = 0;
+                while (same_n < c.parked_ids.size() && same_n < r.ids.size() && c.parked_ids[same_n] == r.ids[same_n])
+                    ++same_n;
+                if (same_n > best_n) {
+                    best_n = same_n;
+                    best = k;
+                }
+            }
+            // (a shared start of 16 tokens is the same conversation; a shorter one is an exact continuation)
+            if (best < bslots.size() &&
+                (best_n >= 16 || (best_n == bslots[best].parked_ids.size() && best_n < r.ids.size()))) {
+                std::string e;
+                if (m.slot_load(bslots[best].parked.data(), bslots[best].parked.size(), (int64_t) bslots[best].parked_tokens, e)) {
+                    from_park = true;
+                    std::fprintf(stderr, "ds4 serve: slot %zu's kept conversation taken back (%zu of the prompt's %zu tokens shared)\n",
+                                 best, best_n, r.ids.size());
+                }
+                else
+                    std::fprintf(stderr, "ds4 serve: slot %zu's kept conversation could not be loaded (%s)\n", best, e.c_str());
+            }
         }
         const auto& st = m.tokens();
         const size_t n_state = st.size();
@@ -705,7 +1215,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
             // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
             // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
-            if (held.empty()) slot_put("");
+            if (held.empty() && !from_park) slot_put("");   // (the slot already holds these bytes)
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
             const int64_t rs = m.restorable(limit);
             bool whole = false;
@@ -719,13 +1229,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             else m.reset();
         }
         if (took || from == 0) held.clear();   // (a slot is text only: the state that comes back holds no pictures)
-        if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
+        const long long want_max = admit_slot >= 0 ? admit_max_new : r.max_new;   // (a BGEN admits the whole request)
+        if ((int64_t) r.ids.size() + std::max(0LL, want_max) > m.max_context()) {
             std::printf("ERR the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", r.ids.size(),
-                        r.max_new, (long long) m.max_context());
+                        want_max, (long long) m.max_context());
             std::fflush(stdout);
             continue;
         }
-        std::string err;
+        err.clear();
         bool ok = true;
         // the pictures whose spans the prompt reads (the rest the state holds): encoded (or the cache's), checked
         if (!pics.empty()) {
@@ -781,12 +1292,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (from > 0 && from < total) m.checkpoint(1);
         m.set_cancel([&in] { return in.stop.load(); });
         bool stopped = false;
+        int64_t gave_way = -1;   // BYIELD: the read stops here for a shorter request; the part read stays in the model
         while (ok && done < total) {
             if (in.stop.load()) {
                 stopped = true;
                 break;
             }
-            size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
+            // (#656) a shorter request is waiting for the control lines: the read gives way at a chunk boundary (a read
+            // with pictures is not cut - its spans' state would have to be rebuilt)
+            if (pics.empty() && in.byield.load() >= 0 && done > from) {
+                gave_way = (int64_t) done;
+                break;
+            }
+            // (#656) with batch slots a read is fed in slices: between two of them a shorter request gets the control
+            // lines, and the state stops where it is consistent (mid-run it is not - a STOP goes back to the start)
+            const size_t slice = batch_slots > 0 && pics.empty() ? (size_t) slice_tokens : (size_t) m.feed_unit();
+            const double t_slice = now_ms();
+            size_t n = std::min<size_t>(slice, total - done);
             if (pin_at > done && pin_at < done + n) n = pin_at - done;
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = done + n == total;
@@ -798,6 +1320,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 ok = fin ? m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err)
                          : m.feed(r.ids.data() + done, (int) n, 0, err);
             done += n;
+            const double slice_ms = now_ms() - t_slice;
             if (ok && pin_at != 0 && done == pin_at) m.checkpoint(3);
             if (ok && (done >= next_pp || done == total)) {
                 const double ms = now_ms() - t0;
@@ -806,9 +1329,79 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::fflush(stdout);
                 next_pp = done + 64;
             }
+            // the read shares the engine with the slots that decode: its state is set aside for their bursts and brought
+            // back afterwards (the same bytes Model::slot_save takes) - a 4k-token read no longer holds the model for its
+            // whole length.  The decodes get about half the slice's time; a big state (the copies would cost more than
+            // they give) and a read with pictures stay on the old path, and so does one with nothing decoding.
+            if (ok && done < total && batch_slots > 0 && pics.empty() && held.empty() && m.pos() <= 32768) {
+                if (live) {
+                    // the slots' sequences are their own: the read's state is not in their way, so they decode for a
+                    // while and the read goes on where it stopped (nothing is saved or loaded)
+                    const double until = now_ms() + std::min(1000.0, slice_ms * 0.5);
+                    while (now_ms() < until) {
+                        if (step_mode) {
+                            if (step_round() == 0) break;
+                            continue;
+                        }
+                        const int s = next_active();
+                        if (s < 0) break;
+                        run_slot(s);
+                    }
+                    m.use_seq(read_seq);
+                    cur = -1;
+                } else {
+                std::vector<uint8_t> read_state;
+                std::string e;
+                const int64_t read_at = m.pos();
+                const double t_park = now_ms();
+                if (m.slot_save(read_state, e) != 0) {
+                    const double t_parked = now_ms();
+                    m.reset();
+                    const double until = t_parked + std::min(1000.0, slice_ms * 0.5);
+                    while (now_ms() < until) {
+                        if (step_mode) {
+                            if (step_round() == 0) break;
+                            continue;
+                        }
+                        const int s = next_active();
+                        if (s < 0) break;
+                        run_slot(s);
+                    }
+                    if (cur >= 0 && !park_slot(cur)) end_slot(cur, "cancel");   // (the last burst's state, before the read's)
+                    const double t_decodes = now_ms();
+                    const bool back = m.slot_load(read_state.data(), read_state.size(), read_at, e);
+                    if (slot_trace)
+                        std::fprintf(stderr,
+                                     "ds4 read: slice %.0f ms, %.1f MB parked in %.1f ms, decodes %.1f ms, back %.1f ms\n",
+                                     slice_ms, (double) read_state.size() / 1e6, t_parked - t_park,
+                                     t_decodes - t_parked, now_ms() - t_decodes);
+                    if (!back) {
+                        std::fprintf(stderr, "ds4 serve: the prompt read's state could not be brought back (%s)\n", e.c_str());
+                        ok = false;
+                        err = "the prompt read's state could not be brought back";
+                    }
+                    cur = -1;
+                }
+                }
+            }
         }
         m.set_cancel(nullptr);
         m.set_images({});
+        if (gave_way >= 0) {
+            // the read gives way: the part read stays in the model (its tokens = gave_way), the server sends the same
+            // prompt again and this read goes on from there - never from 0, so a long prompt cannot be starved
+            const int ys = in.byield.load();
+            in.byield.store(-1);
+            std::fprintf(stderr, "ds4 serve: the prompt read gave way after %lld of %zu tokens (slot %d, %.0f ms)\n",
+                         (long long) gave_way, total, ys, now_ms() - t0);
+            std::printf("YIELDED %d %lld\n", ys, (long long) gave_way);
+            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %lld 0 0\n", r.ids.size(), now_ms() - t0, (long long) gave_way);
+            if (admit_slot >= 0) std::printf("BADM %d 0\n", admit_slot);
+            std::fflush(stdout);
+            held.clear();
+            cur = -1;   // (the conversation is in the model, but no slot owns it)
+            continue;
+        }
         if (stopped || (!ok && m.cancelled())) {
             const bool back = from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from;
             if (!back) {
@@ -818,6 +1411,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fprintf(stderr, "ds4 serve: stopped while reading the prompt of %zu tokens, after %.0f ms%s\n",
                          total, now_ms() - t0, back ? "; the conversation before it is kept" : "");
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", r.ids.size(), now_ms() - t0, back ? from : (size_t) 0);
+            if (admit_slot >= 0) std::printf("BADM %d 0\n", admit_slot);
             std::fflush(stdout);
             continue;
         }
@@ -834,99 +1428,47 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.checkpoint(0);
         if (!continued && slot_max > 0) m.pin();   // (a new run of prompts: where it may be rendered again from)
         const double t1 = now_ms();
-        long long produced = 0;
-        const char* finish = "length";
-        const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
-        long long d_off = 0, d_acc = 0;
-        bool cool = false;
-        int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
-        std::vector<int> got;
-        // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
-        // VRAM hit, promotions a token) and DeepSeek's own - experts a token on the CPU lane, MB a token the storage
-        // read (Linux), the n-gram memory's (Engram) read time a token, the drafts' acceptance
-        const strata::ds4::Stats s_dec = m.stats();
-        const long long io_dec = io_read_bytes();
-        auto stat_line = [&]() {
-            const strata::ds4::Stats& s = m.stats();
-            const double ms = now_ms() - t1;
-            const double fed = (double) std::max<int64_t>(1, s.tokens - s_dec.tokens);
-            const double ex = (double) (s.experts - s_dec.experts), cx = (double) (s.cpu_experts - s_dec.cpu_experts);
-            std::string out = "STAT";
-            char b[160];
-            std::snprintf(b, sizeof b, " tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f ram=%.3f promo=%.3f engram_ms=%.3f",
-                          ms > 0 ? 1000.0 * (double) produced / ms : 0.0, produced > 0 ? ms / (double) produced : 0.0,
-                          ex > 0 ? 1.0 - cx / ex : 1.0, cx / fed, (double) (s.ram_experts - s_dec.ram_experts) / fed,
-                          (double) (s.swaps - s_dec.swaps) / fed, (s.engram_ms - s_dec.engram_ms) / fed);
-            out += b;
-            const long long io = io_read_bytes();
-            if (io >= 0 && io_dec >= 0) {
-                std::snprintf(b, sizeof b, " disk_mb=%.3f", (double) (io - io_dec) / 1e6 / fed);
-                out += b;
-            }
-            if (d_off > 0) {
-                std::snprintf(b, sizeof b, " drafts=%.3f", (double) d_acc / (double) d_off);
-                out += b;
-            }
-            if (s.skipped > s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)
-                std::snprintf(b, sizeof b, " skipped=%.3f", (double) (s.skipped - s_dec.skipped) / fed);
-                out += b;
-            }
-            std::printf("%s\n", out.c_str());
-        };
-        for (;;) {
-            if (in.stop.load()) {
-                finish = "cancel";
-                break;
-            }
-            std::printf("T %d\n", tok);
-            ++produced;
-            if (produced % 8 == 0) stat_line();
-            std::fflush(stdout);
-            bool end = false;
-            for (int e : eos) end = end || tok == e;
-            if (end) {
-                finish = "stop";
-                break;
-            }
-            if (produced >= limit || m.pos() >= m.max_context()) break;
-            if (got.empty()) {   // the next round: the drafts (if any) and the token after them
-                const int room = (int) std::min<long long>(limit - produced, m.max_context() - m.pos());
-                int off = 0, acc = 0;
-                // a round whose drafts were all below the confidence floor: the next one does without the drafter
-                // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
-                const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
-                if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
-                           r.min_p, r.seed, counter, got,
-                           off, acc, err, r.cum)) {
-                    std::fprintf(stderr, "ds4: %s\n", err.c_str());
-                    finish = "cancel";
-                    break;
-                }
-                d_off += off;
-                d_acc += acc;
-                cool = try_spec && off == 0;
-                std::reverse(got.begin(), got.end());
-            }
-            tok = got.back();
-            got.pop_back();
+        Run run;
+        run.slot = admit_slot;
+        run.req = r;
+        run.reused = from;
+        run.t_prompt0 = t0;
+        run.t_prompt1 = t1;
+        // (a BGEN's admission: the limit is what the request asked for - its first token included; the rewritten line's
+        // own max_new is 1)
+        run.limit = admit_slot >= 0 ? admit_max_new
+                                    : (r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size());
+        run.counter = counter;
+        run.tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
+        run.s_dec = m.stats();
+        run.io_dec = io_read_bytes();
+        run.no_switch = !held.empty();   // (a state that holds pictures cannot be set aside: run it to its end)
+        if (admit_slot >= 0) {
+            // a batch slot: its admission (the T line, DONE and BADM) is the first of its bursts, printed by the
+            // scheduler - the other slots get the model in turn
+            bslots[(size_t) admit_slot] = std::move(run);
+            bslots[(size_t) admit_slot].active = true;
+            cur = admit_slot;
+            continue;
         }
-        // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
-        //  the checkpoint at this prompt's end)
-        stat_line();
+        // solo: one request at a time, to its end (the engine the server ran before --batch)
+        while (run_advance(run)) {
+        }
+        stat_line(run);
         const double t2 = now_ms();
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
-                    d_acc, d_off, from);
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", run.produced, r.ids.size(), t1 - t0, t2 - t1,
+                    run.finish, run.d_acc, run.d_off, from);
         std::fflush(stdout);
         const auto& s = m.stats();
         std::fprintf(stderr,
                      "maya ds4 serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), %lld generated "
                      "in %.0f ms (%.2f tok/s); CPU lane %.1f%% of the experts\n",
                      r.ids.size(), from, r.ids.size() - from, t1 - t0,
-                     t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, produced, t2 - t1,
-                     t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
+                     t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, run.produced, t2 - t1,
+                     t2 > t1 ? 1000.0 * (double) run.produced / (t2 - t1) : 0.0,
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
-        if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
-                                    per_position(s_dec, s).c_str());
+        if (run.d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", run.d_acc, run.d_off,
+                                         per_position(run.s_dec, s).c_str());
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
@@ -1194,6 +1736,11 @@ int main(int argc, char** argv) {
     unsigned long long cli_seed = 1;
     bool serve_mode = false;
     bool pack_info_mode = false;
+    bool admit_order = false;
+    int burst = 0;
+    int batch_slots = 0;   // --batch N: the server's batched path (docs/DSV41_BATCHING.md, M4); 0: one request at a time
+    int slot_burst = 0;    // --slot-burst K: tokens one slot decodes before another gets the model (0: measured)
+    int read_slice = 1024; // --read-slice N: tokens of a prompt one feed reads (a BYIELD lands between two of them)
     std::string images, enc_rgb, enc_out;
     std::string score_ids, score_out, prof_ids, spec_ids;
     int enc_w = 0, enc_h = 0;
@@ -1210,6 +1757,7 @@ int main(int argc, char** argv) {
         else if (a == "--gpus") {
             for (int g : parse_ids(val("--gpus"))) o.gpus.push_back(g);
         } else if (a == "--max-context") o.max_context = std::atoll(val("--max-context").c_str());
+        else if (a == "--slot-context") o.slot_context = std::atoll(val("--slot-context").c_str());
         else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val("--reserve-mib").c_str());
         else if (a == "--vram-experts") o.vram_experts = std::atof(val("--vram-experts").c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val("--cpu-threads").c_str());
@@ -1265,6 +1813,11 @@ int main(int argc, char** argv) {
         else if (a == "--profile-run") prof_ids = val("--profile-run");
         else if (a == "--spec-eval") spec_ids = val("--spec-eval");
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--admit-order") admit_order = true;
+        else if (a == "--burst") burst = std::atoi(val("--burst").c_str());
+        else if (a == "--batch") batch_slots = std::max(0, std::atoi(val("--batch").c_str()));
+        else if (a == "--slot-burst") slot_burst = std::max(0, std::atoi(val("--slot-burst").c_str()));
+        else if (a == "--read-slice") read_slice = std::max(0, std::atoi(val("--read-slice").c_str()));
         else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
@@ -1289,7 +1842,31 @@ int main(int argc, char** argv) {
     }
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
+    if (o.slot_context <= 0) {   // (or STRATA_DS4_SLOT_CONTEXT=N: M5's measured plan, without a new command line)
+        const char* e = std::getenv("STRATA_DS4_SLOT_CONTEXT");
+        if (e != nullptr) o.slot_context = std::atoll(e);
+    }
     o.vision_only = !enc_rgb.empty();
+    if (admit_order) {                                 // the M1 admission order, without a model
+        Lines in;
+        in.start();
+        std::string line;
+        int shown = 0;
+        while (in.next(line)) {
+            if (line == "QUIT") break;
+            admit_short_first(in, line);
+            bool g = false;
+            const int64_t len = gen_prompt_len(line, g);
+            std::printf("ADMIT %lld %s\n", (long long) len, g ? "gen" : "other");
+            std::fflush(stdout);
+            if (++shown >= 64) break;
+        }
+        return 0;
+    }
+
+    // a batched engine holds one sequence a slot (M2): the rings, the compressed tables and the state are allocated for
+    // them, plus one for a solo GEN (an explicit STRATA_DS4_NSEQ wins)
+    if (serve_mode && batch_slots > 0) setenv("STRATA_DS4_NSEQ", std::to_string(batch_slots + 1).c_str(), 0);
     strata::ds4::Model m;
     std::string err;
     if (!m.load(o, err)) {
@@ -1298,7 +1875,7 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (const char* idle = std::getenv("DS4_TEST_IDLE_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(idle)));   // (tests: a person typing)
-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
+    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, batch_slots, slot_burst, read_slice);
     const int window_given = window;
     if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)
     if (!prof_ids.empty()) return profile_run(m, prof_ids, window);

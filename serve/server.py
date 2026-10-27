@@ -313,6 +313,10 @@ def _timeout_env(name: str, default: float) -> float | None:
 # still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
 # STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
 ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
+# chunked decoding (docs/DSV41_BATCHING.md, Path B2): tokens per GEN pass, and whether a pass
+# that hits the cap continues with prompt+generated instead of ending the reply (off unless asked)
+BURST = max(0, int(os.environ.get("STRATA_BURST") or 0))
+BURST_CONTINUE = os.environ.get("STRATA_BURST_CONTINUE") == "1"
 # --batch: new requests take the control lines (one prompt read at a time) short prompts first: a prompt of at most
 # STRATA_ADMIT_SHORT_FIRST tokens goes before longer ones (opt-in; unset or 0: whoever gets the lock first), and a
 # longer one that waited STRATA_ADMIT_MAX_WAIT_S (default 30) counts as short.  A chat question then waits for the one
@@ -4700,6 +4704,10 @@ class Service:
             return round(v / unit, digits) if isinstance(v, (int, float)) else None
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
+        # M6: how many requests are admitted but hold no slot (in flight minus the slots that do hold one)
+        slots_now = list(getattr(self.engine, "slot_busy", None) or [])
+        busy_n = sum(1 for b in slots_now if b)
+        waiting_n = max(0, int(running) + int(s.get("queued") or 0) - busy_n)
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
@@ -4711,8 +4719,13 @@ class Service:
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
             # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
+            # M6: the batch slots as they stand - which hold a request, how many wait - so the monitor can draw the
+            # parallel view from the engine's own bookkeeping rather than guess it from the request list
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
-                            "requested": getattr(self, "requested_slots", max(1, int(getattr(self.engine, "batch", 0) or 0)))},
+                            "requested": getattr(self, "requested_slots", max(1, int(getattr(self.engine, "batch", 0) or 0))),
+                            "slots": [{"slot": i, "busy": bool(b)} for i, b in enumerate(slots_now)],
+                            "busy": busy_n,
+                            "waiting": waiting_n},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
             "image_generation": self.images.status() if self.images is not None else {"enabled": False},
@@ -5259,8 +5272,11 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        per_pass = max_new - n
+                        if BURST > 0:
+                            per_pass = min(per_pass, BURST)
+                        gen = self.engine.generate(prompt, per_pass, sampling, cancel, embeddings=emb) if emb \
+                            else self.engine.generate(prompt, per_pass, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -5441,6 +5457,11 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        if (BURST_CONTINUE and BURST > 0 and per_pass >= BURST and n < max_new
+                                and not cancel.is_set() and finish != "stop"):
+                            # the pass hit the chunk cap and the model did not stop: continue from what it wrote
+                            prompt = list(ids) + raw_ids
+                            continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a

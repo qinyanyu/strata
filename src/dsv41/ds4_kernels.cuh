@@ -48,6 +48,8 @@ struct Finish {
     const float* w = nullptr;
     float eps = 1e-20f;
     int rd = 0, pos = 0, inverse = 0, vpp = 1, pos_step = 1;
+    const int* pos_rows = nullptr;   // row v's query's position (row v / vpp) outright (M2's batched step: several
+                                     // sequences' tokens in one pass)
     const float* freqs = nullptr;   // rd / 2 values
     int quant = 0;
     uint16_t* dst = nullptr;
@@ -124,6 +126,9 @@ struct Rows {
     long long p0 = 0;
 };
 
+/// p += add over each of rows rows of stride ints (M2's batched step: a sequence's picks, made absolute in the shared
+/// compressed table - the indexer scans the sequence's own region, the attention reads the one buffer).
+void rows_add_i(int* p, int rows, int stride, int add, cudaStream_t s);
 /// The indexer's scores, row t: out[t][i] = sum_h relu(q[t][h] . k[p]) w[t][h] for i < n (the widest query's), p = i, or
 /// with candidates p = cand[t][i / blk] * blk + i % blk for i < lim.k[t] * blk; positions >= lim.n[t] (or past the
 /// query's candidates) -> -inf.  q rows heads * hd apart, w rows 64, cand rows cand_stride, out rows out_stride; the keys
