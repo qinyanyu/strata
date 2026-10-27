@@ -151,6 +151,59 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <set>
 #include <vector>
 
+// logprobs=K / allowed=...: one `LP` line for the token just emitted, from `ver`'s head
+// logits for the window row it came from (before sampling, penalties and temperature).
+// Format matches the SYCL port's LP line so one server-side reader serves both.
+void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token, int k,
+                   const std::vector<int32_t>& allowed) {
+    if (k < 0) return;
+    static std::vector<float> row;
+    row.resize((size_t) ver.vocab());
+    if (!ver.copy_logits(t, row.data())) {
+        std::printf("LP nan\n");
+        return;
+    }
+    float mx = -INFINITY;
+    for (const float v : row) mx = std::max(mx, v);
+    double se = 0.0;
+    for (const float v : row) se += std::exp((double) v - (double) mx);
+    const double lse = (double) mx + std::log(se);
+    std::printf("LP %.6f", (double) row[(size_t) token] - lse);
+    if (!allowed.empty()) {
+        // 只要调用方点名的那几个 id：server 侧再按它们归一化 ⇒ 与 allowed_token_ids 语义一致。
+        // server 只在能从 tokenizer 读到词表大小时把越界 id 拒为 400；引擎自己的 vocab() 是权威，
+        // 越界的 id 不出现在行上，也就不会越界读 logits
+        for (const int32_t id : allowed) {
+            if (id == token || id < 0 || (int64_t) id >= ver.vocab()) continue;
+            std::printf(" %d:%.6f", (int) id, (double) row[(size_t) id] - lse);
+        }
+        std::printf("\n");
+        return;
+    }
+    if (k > 0) {
+        static std::vector<int32_t> ord;
+        ord.resize(row.size());
+        for (size_t v = 0; v < row.size(); ++v) ord[v] = (int32_t) v;
+        const int kk = std::min<int>(k, (int) row.size());
+        std::partial_sort(ord.begin(), ord.begin() + kk, ord.end(),
+                          [&](int32_t a, int32_t b) { return row[(size_t) a] > row[(size_t) b]; });
+        for (int j = 0; j < kk; ++j)
+            std::printf(" %d:%.6f", ord[(size_t) j], (double) row[(size_t) ord[(size_t) j]] - lse);
+    }
+    std::printf("\n");
+}
+
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_HIP_GFX906)
+// The ordinary decode path extracts all accepted rows in one GPU call. Keep
+// the LP wire and chosen-token-plus-top-K shape; GPU ties sort by token ID.
+void emit_lp_items_line(const strata::kernels::LogprobItem* row, int k) {
+    std::printf("LP %.6f", (double) row[0].logprob);
+    for (int j = 1; j <= k; ++j)
+        std::printf(" %d:%.6f", (int) row[j].id, (double) row[j].logprob);
+    std::printf("\n");
+}
+#endif
+
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
@@ -12338,6 +12391,11 @@ int main(int argc, char** argv) {
             std::string req_bias_text;
             bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            // logprobs=K (0..20): after each "T id" an "LP logprob id:logprob ..." line.
+            // -1 (absent) = no LP lines, so a server that never asks sees today's output.
+            int req_logprobs = -1;
+            // allowed=a,b,c: with logprobs, print only these token ids (renormalized server-side).
+            std::vector<int32_t> req_allowed;
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
@@ -12377,6 +12435,18 @@ int main(int argc, char** argv) {
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "logprobs") req_logprobs = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "allowed") {
+                        const std::string csv = tok.substr(eq + 1);
+                        size_t p = 0;
+                        while (p < csv.size()) {
+                            const size_t c = csv.find(",", p);
+                            const std::string one = csv.substr(p, c == std::string::npos ? std::string::npos : c - p);
+                            if (!one.empty()) req_allowed.push_back((int32_t) std::atoi(one.c_str()));
+                            if (c == std::string::npos) break;
+                            p = c + 1;
+                        }
+                    }
                     else if (key == "min_p") req_min_p = fv;
                     else if (key == "penalty_last_n") req_penalty_last_n = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "penalty_repeat") req_penalty_repeat = fv;
@@ -14770,6 +14840,7 @@ int main(int argc, char** argv) {
                     bool eos = false;
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
+                        emit_lp_line(V1(A), i, outp[(size_t) i], req_logprobs, req_allowed);
                         strata::core::progress_beat();
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
@@ -15187,9 +15258,31 @@ int main(int argc, char** argv) {
                     draft_accepted += a;
                 }
                 first_window = false;
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_HIP_GFX906)
+                // Named allowed IDs use the existing CPU path, which emits every named
+                // ID rather than top K. Unsupported vocabulary/K sizes use it too.
+                const bool lp_gpu = req_logprobs >= 0 && req_allowed.empty() &&
+                                    ver.vocab() <= std::numeric_limits<int>::max() &&
+                                    strata::kernels::logprobs_scratch_bytes(1, (int) ver.vocab(), req_logprobs) != 0;
+                std::vector<strata::kernels::LogprobItem> lp_items;
+                if (lp_gpu) {
+                    lp_items.resize((size_t) (a + 1) * (req_logprobs + 1));
+                    if (!ver.logprobs(a + 1, outv.data(), req_logprobs, lp_items.data(), err)) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                }
+#endif
                 bool eos = false;
                 for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_HIP_GFX906)
+                    if (lp_gpu)
+                        emit_lp_items_line(lp_items.data() + (size_t) i * (req_logprobs + 1), req_logprobs);
+                    else
+#endif
+                    emit_lp_line(ver, i, outv[(size_t) i], req_logprobs, req_allowed);
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);
