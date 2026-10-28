@@ -1,0 +1,80 @@
+Using the Strata server already running at http://127.0.0.1:8080.
+Running the suite (about 3-10 minutes) ...
+warming up (not measured) ...
+  calibrated: about 1.08 tokens per word
+chat: 3 short questions x 3 runs, up to 100 new tokens
+  run 1 q1: decode 190.8 tok/s, first token 0.281 s, 100 tokens
+  run 1 q2: decode 123.4 tok/s, first token 0.469 s, 100 tokens
+  run 1 q3: decode 107.7 tok/s, first token 0.299 s, 100 tokens
+  run 2 q1: decode 189.3 tok/s, first token 0.278 s, 100 tokens
+  run 2 q2: decode 126.8 tok/s, first token 0.276 s, 100 tokens
+  run 2 q3: decode 117.9 tok/s, first token 0.284 s, 100 tokens
+  run 3 q1: decode 184.1 tok/s, first token 0.282 s, 100 tokens
+  run 3 q2: decode 130.3 tok/s, first token 0.273 s, 100 tokens
+  run 3 q3: decode 123.4 tok/s, first token 0.299 s, 100 tokens
+4K prompt: 3 fresh prompts of about 4096 tokens, 24 new tokens
+  run 1: 4019 tokens, prompt 2050.4 tok/s (0 reused), first token 1.993 s
+  run 2: 4019 tokens, prompt 2067.6 tok/s (0 reused), first token 1.975 s
+  run 3: 4019 tokens, prompt 2058.9 tok/s (0 reused), first token 1.984 s
+16K prompt: 3 fresh prompts of about 16384 tokens, 24 new tokens
+  run 1: 16058 tokens, prompt 1340.4 tok/s (0 reused), first token 12.231 s
+  run 2: 16058 tokens, prompt 3101.5 tok/s (0 reused), first token 5.227 s
+  run 3: 16058 tokens, prompt 3102.6 tok/s (0 reused), first token 5.225 s
+agent: a session of 6 turns with four tools, x 3 runs
+  run 1 turn 0: prompt 609, reused 0, read 609, first token 1.5 s
+  run 1 turn 1: prompt 2095, reused 626, read 1469, first token 1.5 s
+  run 1 turn 2: prompt 5539, reused 2158, read 3381, first token 1.569 s
+  run 1 turn 3: prompt 8465, reused 5603, read 2862, first token 2.39 s
+  run 1 turn 4: prompt 11379, reused 8480, read 2899, first token 3.013 s
+  run 1 turn 5: prompt 15494, reused 11422, read 4072, first token 2.9 s
+  run 2 turn 0: prompt 609, reused 0, read 609, first token 0.632 s
+  run 2 turn 1: prompt 2101, reused 632, read 1469, first token 1.104 s
+  run 2 turn 2: prompt 5545, reused 2165, read 3380, first token 1.525 s
+  run 2 turn 3: prompt 8471, reused 5609, read 2862, first token 1.455 s
+  run 2 turn 4: prompt 11385, reused 8486, read 2899, first token 1.535 s
+  run 2 turn 5: prompt 15480, reused 11408, read 4072, first token 2.293 s
+  run 3 turn 0: prompt 609, reused 0, read 609, first token 0.623 s
+  run 3 turn 1: prompt 2088, reused 620, read 1468, first token 1.09 s
+  run 3 turn 2: prompt 5532, reused 2151, read 3381, first token 1.533 s
+  run 3 turn 3: prompt 8458, reused 5596, read 2862, first token 1.465 s
+  run 3 turn 4: prompt 11421, reused 8522, read 2899, first token 1.537 s
+  run 3 turn 5: prompt 15546, reused 11474, read 4072, first token 2.293 s
+32K prompt: 3 fresh prompts of about 32768 tokens, 24 new tokens
+  run 1: 32049 tokens, prompt 2370.6 tok/s (0 reused), first token 13.796 s
+  run 2: 32049 tokens, prompt 3183.6 tok/s (0 reused), first token 10.138 s
+  run 3: 32049 tokens, prompt 3181.3 tok/s (0 reused), first token 10.147 s
+
+Results (median, range over the runs):
+  chat decode tok/s                    126.80   (107.70 - 190.80, n=9)
+  chat first token (s)                   0.28   (0.27 - 0.47, n=9)
+  4K prompt tok/s                     2058.90   (2050.40 - 2067.60, n=3)
+  4K first token (s)                     1.98   (1.98 - 1.99, n=3)
+  16K prompt tok/s                    3101.50   (1340.40 - 3102.60, n=3)
+  16K first token (s)                    5.23   (5.22 - 12.23, n=3)
+  32K prompt tok/s                    3181.30   (2370.60 - 3183.60, n=3)
+  32K first token (s)                   10.15   (10.14 - 13.80, n=3)
+  agent cache hit %                     65.84   (65.83 - 65.89, n=3)
+  agent re-read tokens/session           3.00   (2.00 - 4.00, n=3)
+  agent turn first token (s)             1.53   (1.09 - 3.01, n=15)
+  agent decode tok/s                   110.00   (94.90 - 129.90, n=15)
+
+Report: /var/log/strata/bench/2026-10-27-community-hl-225-qwen3-8-flash-next-uncensored-iq4-xs/README.md
+Share it: open a pull request that adds the folder /var/log/strata/bench/2026-10-27-community-hl-225-qwen3-8-flash-next-uncensored-iq4-xs (see docs/COMMUNITY_BENCHMARKS.md), or paste README.md into a GitHub issue. Home folders, user and host names and IP addresses are already replaced; read it once before you share it.
+  calibrated: about 1.08 tokens per word
+  4096 run 1: prompt 4019 tokens 2083.4 tok/s, first token 1.96 s, decode 115.2 tok/s over 144 tokens
+  4096 run 2: prompt 4019 tokens 2085.8 tok/s, first token 1.96 s, decode 105.2 tok/s over 136 tokens
+  4096 run 3: prompt 4019 tokens 2088.1 tok/s, first token 1.96 s, decode 98.6 tok/s over 147 tokens
+ 32768 run 1: prompt 32049 tokens 3188.1 tok/s, first token 10.12 s, decode 112.5 tok/s over 163 tokens
+ 32768 run 2: prompt 32049 tokens 3179.4 tok/s, first token 10.15 s, decode 114.3 tok/s over 164 tokens
+ 32768 run 3: prompt 32049 tokens 3177.7 tok/s, first token 10.15 s, decode 114.0 tok/s over 151 tokens
+128000 run 1: prompt 124989 tokens 2585.7 tok/s, first token 48.53 s, decode 104.1 tok/s over 164 tokens
+128000 run 2: prompt 124989 tokens 2918.0 tok/s, first token 43.00 s, decode 106.0 tok/s over 185 tokens
+128000 run 3: prompt 124989 tokens 2915.2 tok/s, first token 43.08 s, decode 111.3 tok/s over 151 tokens
+done
+  32k depth  10%: FOUND  (32,778 prompt tokens, 11 s)
+  32k depth  50%: FOUND  (32,778 prompt tokens, 10 s)
+  32k depth  90%: FOUND  (32,779 prompt tokens, 10 s)
+ 128k depth  10%: FOUND  (125,046 prompt tokens, 44 s)
+ 128k depth  50%: FOUND  (125,044 prompt tokens, 44 s)
+ 128k depth  90%: FOUND  (125,044 prompt tokens, 44 s)
+6 of 6 found
