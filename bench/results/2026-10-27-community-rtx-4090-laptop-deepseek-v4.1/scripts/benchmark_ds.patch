@@ -1,0 +1,38 @@
+--- bench/results/2026-09-30-community-rtx-5090/benchmark.py	2026-10-08 10:56:54.835745406 +0200
++++ scripts/benchmark_ds.py	2026-10-27 22:40:33.798530044 +0100
+@@ -33,9 +33,16 @@
+     tokens = [None] * len(vocab)
+     for token, number in vocab.items():
+         tokens[number] = token
++    tcfg = json.loads((directory / "tokenizer.json").read_text(encoding="utf-8")) if (directory / "tokenizer.json").exists() else {}
+     tokenizer = Tokenizer(tokens, (directory / "merges.txt").read_text(encoding="utf-8").splitlines(),
+-                          json.loads((directory / "token_type.json").read_text(encoding="utf-8")))
++                          json.loads((directory / "token_type.json").read_text(encoding="utf-8")),
++                          tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)   # as serve/server.py: DeepSeek's pre-tokenizer
++    if tcfg.get("pre") == "deepseek3":                     # as serve/server.py's set_family for DeepSeek-V4.1
++        import serve.frontend
++        serve.frontend.use_family("deepseek41")
+     template = ChatTemplate(directory / "chat_template.jinja")
++    # DeepSeek: the start token (id 0) is counted by the engine, but the template's bos_token renders empty here
++    start_token = 1 if tcfg.get("pre") == "deepseek3" else 0
+     initial = get(args.url + "/v1/status")
+     (args.out / "initial-status.json").write_text(json.dumps(initial, indent=2) + "\n")
+     rows = []
+@@ -47,7 +54,7 @@
+ 
+     def count(req):
+         messages, tools, kwargs = openai_to_messages(req)
+-        return len(tokenizer.encode(template.render(messages, tools, **kwargs), parse_special=True))
++        return len(tokenizer.encode(template.render(messages, tools, **kwargs), parse_special=True)) + start_token
+ 
+     def perform(label, req, expected=None):
+         body = json.dumps(req).encode()
+@@ -57,7 +64,7 @@
+         started = time.perf_counter()
+         wire = urllib.request.Request(args.url + "/v1/chat/completions", data=body,
+                                       headers={"Content-Type": "application/json"})
+-        with urllib.request.urlopen(wire, timeout=1800) as response:
++        with urllib.request.urlopen(wire, timeout=3600) as response:
+             for line in response:
+                 if not line.startswith(b"data: "):
+                     continue
