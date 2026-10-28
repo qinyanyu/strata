@@ -7702,7 +7702,7 @@ int main(int argc, char **argv) try {
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
-            // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
+            // #342: before make_room evicts, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "

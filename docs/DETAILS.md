@@ -699,12 +699,29 @@ the engine (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`, less 
 the source. It covers parking and session files only, not the startup sizing of the arena, the resident budget or the Windows commit check.
 
 Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. They add host RAM, not VRAM. Oldest parked entries
-are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)
+are evicted first (pinned ones and a conversation borrowed mid-attempt stay). A new conversation that starts at a checkpoint inside
+a parked one (sub-agents that share a system prompt)
 restores that prefix and leaves the parked conversation in place (the log says "borrowed"). Oversized snapshots or host
 allocation failures fall back to ordinary prompt processing. With `--layer-split` a parked conversation holds one image per
 stage. Parked snapshots are not kept across restarts; session files are. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables K/V
 retention for diagnostics. The Monitor tab's **Conversation cache** card shows parked, restored and evicted counts and the
 prompt tokens the cache gave back; `/metrics` has the same under `"conversation_cache"`.
+
+RAM is a third limit beside the cache's budget and slots. A park needs its snapshot plus
+`--conversation-cache-min-free-mib` standing in the free RAM (sources above); when it does not fit, the engine evicts parked
+conversations, oldest first, until it fits or none can go. Emptying the cache does not always return what its ledger
+promised: an attempt that ran the cache dry (or found only pinned conversations) and still refuses records the free RAM it
+measured as this box's **empty-cache ceiling**, and from then on predicts from that measured number, not the ledger. A park
+that could not fit even at the ceiling gives up ONE slot, scales the budget with it and tries admission once with the freed
+RAM - the log says `dropping 1 of S slots and shrinking the budget to B MiB so the rest can park again (freed F MiB;
+--conversation-cache-mib sets it)` - and keeps the rest parked when it still does not fit; the next hopeless park gives up
+one more slot, never past the last one, because the learned ceiling, not the cache, is what caps that park. The cuts are not
+permanent: at every park and restore, when free RAM stands above the recorded ceiling AND leaves room for one full-context
+conversation at its real cost, the configured slots and budget come back - `free RAM fits a full conversation again: back to
+S slots and B MiB (--conversation-cache-mib sets it)`. Free RAM climbing back to the ceiling also makes the number stale on
+its own: it is cleared and the attempt runs again. Opt-in `STRATA_CONV_CACHE_CLAMP=1` clamps the budget at startup to the
+slots times what one full-context conversation costs this model, computed from the loaded model: it never raises a budget,
+and a cost the engine cannot compute clamps nothing.
 
 ### Session files (disk)
 
