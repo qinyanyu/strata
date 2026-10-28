@@ -378,6 +378,33 @@ Merge the field into the existing config (this is not a complete run config), ch
 engine, and remove it to go back. If the engine runs in a systemd unit, limit it with `MemoryMax`, never `MemoryHigh`:
 `MemoryHigh` counts the page cache that `--mmap-experts` reads from.
 
+**The engine can lock that memory itself (HIP on Linux, opt-in: `"STRATA_HIP_MLOCK": "1"` in the `env`).** ROCm maps
+host memory for the GPU through a KFD userptr / SVM range (HMM) without pinning it, unlike `cudaHostRegister` on NVIDIA.
+On a GPU without XNACK (every RDNA card) an invalidation of such a page - reclaim, swap, compaction - evicts all of the
+process's GPU queues until the whole range is validated again, and under memory pressure that restore can keep retrying
+for tens of seconds: the "no progress for 60 s ... 0 layers served" stalls, with no thread waiting on the disk. With the
+switch on, every `cudaHostRegister`, `cudaHostAlloc` and `cudaMallocHost` of the HIP build also `mlock`s its range (and
+`munlock`s it before it is unregistered or freed), so the kernel can no longer swap or reclaim it. That needs a large
+memlock limit: `ulimit -l unlimited`, `LimitMEMLOCK=infinity` in a systemd unit, or `--ulimit memlock=-1` with Docker
+(in the documented commands). Without a raised limit this has no effect where it matters: the default limit of most
+distributions (8 MiB on recent kernels) is far below the expert arena, so the arena stays pageable, the log says `mlock
+of ... was refused` once and the engine runs as before, unprotected. Locked memory cannot be swapped or reclaimed: on a
+host where RAM is tight, other processes take that pressure instead (VmLck in `/proc/<pid>/status` shows how much the
+engine holds). Unset or `0`: nothing is locked.
+
+mlock does not stop page migration: with the kernel default `vm.compact_unevictable_allowed=1`, compaction still moves
+locked pages. `sysctl vm.compact_unevictable_allowed=0` keeps them in place (persist it in `/etc/sysctl.d/`). Still not
+covered: khugepaged collapsing the range, fork() of the engine, CMA / memory offline.
+
+Measured on one RX 7900 XTX (gfx1100, ROCm 7.10, Linux 6.18, 64 GB, Swift IQ3_S with 32 GiB of resident experts and
+`HSA_USERPTR_FOR_PAGED_MEM` left at its default), the same build and configuration with only `STRATA_HIP_MLOCK` changed,
+under a load generator that reads 30K-220K-token prompts while another process holds RAM down to 5 GiB free and streams
+a large file through the page cache, `vm.compact_unevictable_allowed=0` in both arms, each arm stopped at its first
+stall: without the lock (`STRATA_HIP_MLOCK=0`) the engine stalled after 103 s and 63 s (0 KiB locked, 0.8-0.9 GiB of it
+in swap); with the lock, both arms ran the full 30 minutes without a stall (29 and 28 requests), with 37 GiB locked and
+8 GiB of the engine's other memory in swap. One machine; `HSA_USERPTR_FOR_PAGED_MEM=0` is no longer needed for this on
+that machine, and leaving it at its default keeps the arena page-locked (prompt reads about twice as fast there).
+
 ## RDNA4 (gfx1201)
 
 The RX 9070 / 9070 XT and the Radeon AI PRO R9700 run the same kernels as gfx1100: wave32, 64 KiB of LDS per workgroup, the
